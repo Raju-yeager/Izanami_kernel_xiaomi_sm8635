@@ -41,7 +41,10 @@ env:
   KERNEL_REPO: "khargosxh18/android_kernel_xiaomi_sm8635"   # built directly = always the dev's latest
   KERNEL_BRANCH: "17"              # Android 17 branch (matches Infinity X v4.0)
   KERNEL_REF: ""                   # optional: pin an exact commit SHA (empty = latest of KERNEL_BRANCH)
-  LOCALVERSION: "-Izanami"         # kernel name -> uname -r = 6.1.x-Izanami+ ; "" keeps the dev's -Vibranium-V18
+  # Kernel name -> uname -r = 6.1.x<LOCALVERSION>+ . Any name works: with CONFIG_MODVERSIONS the
+  # kernel ignores the release word in a module's vermagic and checks symbol CRCs instead.
+  # Examples: "-Izanami"  or  "-Vibranium-Izanami-KSUN" ; "" keeps the dev's -Vibranium-V18
+  LOCALVERSION: "-Izanami"
   DEFCONFIG: "gki_defconfig"
   FRAGMENTS: "vendor/pineapple_GKI.config vendor/peridot_GKI.config"  # space separated, "" for none
   CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz"
@@ -211,12 +214,17 @@ jobs:
           export PATH="$HOME/clang/bin:$PATH"
           export CCACHE_COMPILERCHECK=content
 
-          # Fix glibc 2.43+ C23 const-qualifier error in libbpf / resolve_btfids host tool
+          # Host-tool fix 1: glibc 2.43+ C23 const-qualifier error in libbpf / resolve_btfids
           sed -i 's/char \*next_path;/const char *next_path;/g' tools/lib/bpf/libbpf.c || true
           sed -i 's/-Werror//g' tools/lib/bpf/Makefile tools/bpf/resolve_btfids/Makefile || true
 
+          # Host-tool fix 2: certs/extract-cert.c "use of undeclared identifier 'key_pass'".
+          # A recent stable backport wraps key_pass in '#ifdef USE_PKCS11_ENGINE', but this 6.1 file
+          # still uses it unconditionally and never defines that macro. Defining it (HOSTCFLAGS below)
+          # brings the declaration back. Harmless on trees that don't have the problem.
           MK="make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+              HOSTCFLAGS=-DUSE_PKCS11_ENGINE \
               KBUILD_BUILD_USER=ci KBUILD_BUILD_HOST=github"
 
           for f in "$DEFCONFIG" $FRAGMENTS; do
@@ -308,7 +316,8 @@ jobs:
           Flash the zip from recovery or a kernel flasher, then install the matching KernelSU-Next manager.
           Back up your current boot.img before flashing.
           If touch/wifi are dead afterwards, check \`dmesg | grep -iE 'disagrees about version|version magic'\`:
-          that means the module version check rejected the kernel name; set LOCALVERSION to "" in build.yml and rebuild.
+          "disagrees about version of symbol" means the kernel ABI differs from the ROM's modules
+          (a newer upstream commit than your ROM); pin KERNEL_REF in build.yml to your ROM's kernel commit.
           EOF
           sed -i 's/^          //' notes.md
 
