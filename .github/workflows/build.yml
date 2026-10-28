@@ -57,7 +57,7 @@ jobs:
   # Cheap gate: decide whether anything changed since the last release
   # --------------------------------------------------------------------------
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       build: ${{ steps.fp.outputs.build }}
       tag: ${{ steps.fp.outputs.tag }}
@@ -92,7 +92,7 @@ jobs:
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
     defaults:
       run:
@@ -210,6 +210,11 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/clang/bin:$PATH"
           export CCACHE_COMPILERCHECK=content
+
+          # Fix glibc 2.43+ C23 const-qualifier error in libbpf / resolve_btfids host tool
+          sed -i 's/char \*next_path;/const char *next_path;/g' tools/lib/bpf/libbpf.c || true
+          sed -i 's/-Werror//g' tools/lib/bpf/Makefile tools/bpf/resolve_btfids/Makefile || true
+
           MK="make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
               KBUILD_BUILD_USER=ci KBUILD_BUILD_HOST=github"
@@ -262,6 +267,7 @@ jobs:
           do.cleanup=1
           do.cleanuponabort=0
           device.name1=peridot
+          device.name2=fox_peridot
           supported.versions=
           supported.patchlevels=
           supported.vendorpatchlevels=
