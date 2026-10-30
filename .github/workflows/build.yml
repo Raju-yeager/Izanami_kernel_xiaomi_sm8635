@@ -41,10 +41,11 @@ env:
   KERNEL_REPO: "khargosxh18/android_kernel_xiaomi_sm8635"   # built directly = always the dev's latest
   KERNEL_BRANCH: "17"              # Android 17 branch (matches Infinity X v4.0)
   KERNEL_REF: ""                   # optional: pin an exact commit SHA (empty = latest of KERNEL_BRANCH)
-  # Kernel name -> uname -r = 6.1.x<LOCALVERSION>+ . Any name works: with CONFIG_MODVERSIONS the
+  # Kernel name -> uname -r = 6.1.x<KERNEL_NAME>+ . Any name works: with CONFIG_MODVERSIONS the
   # kernel ignores the release word in a module's vermagic and checks symbol CRCs instead.
   # Examples: "-Izanami"  or  "-Vibranium-Izanami-KSUN" ; "" keeps the dev's -Vibranium-V18
-  LOCALVERSION: "-Izanami"
+  # (Do NOT call this LOCALVERSION: kbuild reads an env var of that name and appends it a 2nd time.)
+  KERNEL_NAME: "-Izanami"
   DEFCONFIG: "gki_defconfig"
   FRAGMENTS: "vendor/pineapple_GKI.config vendor/peridot_GKI.config"  # space separated, "" for none
   CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz"
@@ -80,7 +81,7 @@ jobs:
           if [ -z "$K" ] || [ -z "$S" ] || [ -z "$F" ]; then
             echo "::error::could not resolve a ref (kernel=$K ksu=$S susfs=$F)"; exit 1
           fi
-          FP=$(printf '%s' "$K$S$F$CLANG_URL$DEFCONFIG$FRAGMENTS$LOCALVERSION" | sha256sum | cut -c1-10)
+          FP=$(printf '%s' "$K$S$F$CLANG_URL$DEFCONFIG$FRAGMENTS$KERNEL_NAME" | sha256sum | cut -c1-10)
           TAG="ci-$FP"
           if gh release view "$TAG" >/dev/null 2>&1 && [ "$FORCE" != "true" ]; then
             BUILD=false
@@ -185,6 +186,10 @@ jobs:
           grep -q kernelsu drivers/Kconfig  || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           echo "KSU_SHA=$(git -C KernelSU-Next rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "KSU_COUNT=$(git -C KernelSU-Next rev-list --count HEAD)" >> "$GITHUB_ENV"
+          # human version = latest release tag of the KSU-Next repo (falls back to r<commit count>)
+          KSU_TAG="$(git -C KernelSU-Next describe --tags --abbrev=0 2>/dev/null || true)"
+          KSU_VER="$(printf '%s' "${KSU_TAG:-r$(git -C KernelSU-Next rev-list --count HEAD)}" | tr -c 'A-Za-z0-9._-' '_')"
+          echo "KSU_VER=$KSU_VER" >> "$GITHUB_ENV"
 
       # ---- SUSFS ----
       - name: Integrate SUSFS
@@ -194,6 +199,10 @@ jobs:
           rm -rf susfs4ksu
           git clone --depth=1 --branch "$SUSFS_BRANCH" "$SUSFS_REPO" susfs4ksu
           echo "SUSFS_SHA=$(git -C susfs4ksu rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          # human version = SUSFS_VERSION from susfs.h (falls back to the commit hash)
+          SUSFS_VER="$(grep -rhoE '#define[[:space:]]+SUSFS_VERSION[[:space:]]+"[^"]+"' susfs4ksu/kernel_patches/include/linux 2>/dev/null | head -1 | grep -oE '"[^"]+"' | tr -d '"' || true)"
+          SUSFS_VER="$(printf '%s' "${SUSFS_VER:-$(git -C susfs4ksu rev-parse --short HEAD)}" | tr -c 'A-Za-z0-9._-' '_')"
+          echo "SUSFS_VER=$SUSFS_VER" >> "$GITHUB_ENV"
           if [ -f fs/susfs.c ]; then
             echo "::warning::Tree already contains SUSFS (fs/susfs.c); skipping patch step"
             exit 0
@@ -237,8 +246,9 @@ jobs:
           $MK $DEFCONFIG $FRAGMENTS
 
           # Kernel name. (peridot_GKI.config already has LOCALVERSION_AUTO=n, so a "+" is appended.)
-          if [ -n "$LOCALVERSION" ]; then
-            scripts/config --file out/.config --set-str LOCALVERSION "$LOCALVERSION"
+          unset LOCALVERSION || true
+          if [ -n "$KERNEL_NAME" ]; then
+            scripts/config --file out/.config --set-str LOCALVERSION "$KERNEL_NAME"
           fi
 
           # Only KernelSU + SUSFS are added. Everything else (NetHunter, LTO, ...) stays as the repo has it.
@@ -257,6 +267,9 @@ jobs:
           echo "KREL=$KREL" >> "$GITHUB_ENV"
           echo "Built kernel release: $KREL"
           ccache -s | head -8
+          cp out/Module.symvers Module.symvers
+          echo -n "$KREL" > kernel.release
+          sha256sum Module.symvers > Module.symvers.sha256
 
       # ---- Package ----
       - name: Pack AnyKernel3 zip
@@ -265,6 +278,26 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
           rm -rf ak3/.git ak3/.github ak3/README.md ak3/LICENSE ak3/modules ak3/patch ak3/ramdisk
           cp kernel/out/arch/arm64/boot/Image ak3/Image
+
+          # AK3 bundles a 32-bit ARM busybox/magiskboot by default. This ROM (Android 17, 64-bit-only
+          # pineapple GKI) cannot execute 32-bit binaries at all, so the zip's own busybox setup aborts
+          # on-device ("Exec format error") before it ever touches the boot image. Fetch a real aarch64
+          # busybox and swap it in; verify with `file` so a bad fetch fails HERE, in the log, not on your phone.
+          file ak3/tools/busybox ak3/tools/magiskboot ak3/tools/magiskpolicy || true
+          BB_URL="$(gh api repos/osm0sis/android-busybox-ndk/releases/latest --jq             '.assets[] | select(.name | test("aarch64|arm64"; "i")) | select(.name | test("arm-|armeabi|32"; "i") | not) | .browser_download_url'             | head -1)"
+          if [ -z "$BB_URL" ]; then
+            echo "::error::Could not find an aarch64 busybox asset in osm0sis/android-busybox-ndk releases."
+            echo "::error::List assets manually: gh api repos/osm0sis/android-busybox-ndk/releases/latest --jq '.assets[].name'"
+            exit 1
+          fi
+          echo "Fetching replacement busybox: $BB_URL"
+          curl -fL --retry 3 "$BB_URL" -o ak3/tools/busybox
+          chmod 755 ak3/tools/busybox
+          file ak3/tools/busybox
+          file ak3/tools/busybox | grep -qiE 'ELF 64-bit.*(aarch64|ARM aarch64)' || {
+            echo "::error::Fetched busybox is not an aarch64 ELF binary ($BB_URL). Fix BB_URL selection above."
+            exit 1
+          }
           cat > ak3/anykernel.sh <<'EOF'
           ### AnyKernel3 script (kernel-only, boot partition, A/B)
           properties() { '
@@ -302,16 +335,18 @@ jobs:
           fi
           EOF
           sed -i 's/^          //' ak3/anykernel.sh
-          ZIP="${NAME}-${KREL%%-*}-KSUN${KSU_COUNT}-SUSFS-$(date -u +%Y%m%d).zip"
+          ZIP="${NAME}-${KREL%%-*}-KSUN-${KSU_VER}-SUSFS-${SUSFS_VER}-$(date -u +%Y%m%d).zip"
           (cd ak3 && zip -r9 "../$ZIP" . -x '.git*')
           echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          # Published so a later WLAN-module job/workflow can build against this exact kernel ABI.
+          cp kernel/Module.symvers kernel/Module.symvers.sha256 kernel/kernel.release .
           cat > notes.md <<EOF
           Automated build for peridot (POCO F6 / Redmi Turbo 3)
 
           - Kernel release: \`${KREL}\`
           - Kernel commit: \`$(git -C kernel rev-parse --short HEAD)\` (${KERNEL_REPO}@${KERNEL_BRANCH})
-          - KernelSU-Next: \`${KSU_SHA}\` (${KSU_REPO#https://github.com/} @ ${KSU_BRANCH})
-          - SUSFS: \`${SUSFS_SHA}\` (${SUSFS_BRANCH})
+          - KernelSU-Next: \`${KSU_VER}\` (commit \`${KSU_SHA}\`, ${KSU_REPO#https://github.com/} @ ${KSU_BRANCH})
+          - SUSFS: \`${SUSFS_VER}\` (commit \`${SUSFS_SHA}\`, ${SUSFS_BRANCH})
 
           Flash the zip from recovery or a kernel flasher, then install the matching KernelSU-Next manager.
           Back up your current boot.img before flashing.
@@ -323,8 +358,8 @@ jobs:
 
       - name: Publish GitHub Release
         run: |
-          gh release create "$TAG" "$ZIP" \
-            --title "${NAME} ${KREL} | KSUN ${KSU_COUNT} | $(date -u +%Y-%m-%d)" \
+          gh release create "$TAG" "$ZIP" Module.symvers Module.symvers.sha256 kernel.release \
+            --title "${NAME} ${KREL} | KSUN ${KSU_VER} | SUSFS ${SUSFS_VER} | $(date -u +%Y-%m-%d)" \
             --notes-file notes.md
 
       - name: Send to Telegram
@@ -337,7 +372,7 @@ jobs:
           fi
           CAPTION="<b>${NAME}</b> kernel build
           Kernel: <code>${KREL}</code>
-          KSU-Next: <code>${KSU_SHA}</code> | SUSFS: <code>${SUSFS_SHA}</code>"
+          KSU-Next: <code>${KSU_VER}</code> | SUSFS: <code>${SUSFS_VER}</code>"
           curl -fsS -o /dev/null \
             -F chat_id="$TG_CHAT_ID" -F parse_mode=HTML \
             -F caption="$CAPTION" -F document=@"$ZIP" \
