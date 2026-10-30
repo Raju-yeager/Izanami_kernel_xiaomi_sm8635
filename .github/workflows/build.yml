@@ -27,6 +27,10 @@ on:
         description: "Build even if nothing changed since the last release"
         type: boolean
         default: false
+      wlan_test:
+        description: "Build+publish a WLAN driver test bundle only (no kernel flash)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -54,6 +58,9 @@ env:
   SUSFS_REPO: "https://gitlab.com/simonpunk/susfs4ksu.git"
   SUSFS_BRANCH: "gki-android14-6.1"
   SWAP_GB: "10"
+  # WLAN driver source (your fork, with the monitor-mode + injection patches already applied)
+  WLAN_REPO: "https://github.com/Raju-yeager/Izanami_kernel_xiaomi_sm8635-modules.git"
+  WLAN_REF: "wlan-monitor-inject"
   # ----------------------------------------------------------------------------
 
 jobs:
@@ -267,6 +274,11 @@ jobs:
           echo "KREL=$KREL" >> "$GITHUB_ENV"
           echo "Built kernel release: $KREL"
           ccache -s | head -8
+          # `Image` only links vmlinux (producing vmlinux.symvers, the core kernel's own exports).
+          # Module.symvers -- what external/vendor modules build against -- only appears after the
+          # modules pass. modules_prepare generates it without rebuilding vmlinux.
+          $MK CC="ccache clang" modules_prepare
+          [ -f out/Module.symvers ] || { echo "::error::Module.symvers still missing after modules_prepare"; ls out/*.symvers 2>/dev/null; exit 1; }
           cp out/Module.symvers Module.symvers
           echo -n "$KREL" > kernel.release
           sha256sum Module.symvers > Module.symvers.sha256
@@ -388,3 +400,157 @@ jobs:
           curl -fsS -o /dev/null "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             -d chat_id="$TG_CHAT_ID" \
             --data-urlencode text="Kernel build failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true
+
+  # --------------------------------------------------------------------------
+  # On-demand only: builds just the WLAN driver + its platform glue modules
+  # against this kernel source (NOT flashed), so you can test-swap them on
+  # your currently-running ROM via root/adb with insmod -f, no reboot needed.
+  # Run from the Actions tab: "Run workflow" -> wlan_test = true.
+  # --------------------------------------------------------------------------
+  wlan-module-test:
+    if: github.event_name == 'workflow_dispatch' && inputs.wlan_test == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Free disk and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo fallocate -l 8G /mnt/swapfile; sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile; sudo swapon /mnt/swapfile
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev cpio zip lz4 zstd \
+            xz-utils python3 dwarves gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Checkout kernel (headers only, for module building)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          path: kernel
+          ref: ${{ env.KERNEL_REF || env.KERNEL_BRANCH }}
+          fetch-depth: 1
+
+      - name: Checkout WLAN driver source
+        uses: actions/checkout@v4
+        with:
+          repository: Raju-yeager/Izanami_kernel_xiaomi_sm8635-modules
+          ref: ${{ env.WLAN_REF }}
+          path: wlan-src
+          fetch-depth: 1
+
+      - name: Download clang
+        run: |
+          mkdir -p ~/clang
+          curl -fL --retry 5 "$CLANG_URL" | tar -xz -C ~/clang
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare kernel for external module builds
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          sed -i 's/char \*next_path;/const char *next_path;/g' tools/lib/bpf/libbpf.c || true
+          sed -i 's/-Werror//g' tools/lib/bpf/Makefile tools/bpf/resolve_btfids/Makefile || true
+          MK="make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+              CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+              HOSTCFLAGS=-DUSE_PKCS11_ENGINE"
+          $MK $DEFCONFIG $FRAGMENTS
+          $MK olddefconfig
+          # modules_prepare builds just enough (Module.symvers, scripts, generated headers)
+          # for external module builds, without needing a full Image build.
+          $MK modules_prepare
+          echo "KOUT=$PWD/out" >> "$GITHUB_ENV"
+
+      # ---- Platform glue modules (icnss2, cnss_genl -> cnss_nl, cnss_prealloc, cnss_utils) ----
+      - name: Build platform modules
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          P="$PWD/wlan-src/qcom/opensource/wlan/platform"
+          MK="make -j$(nproc) -C $KOUT M=$P ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+              CROSS_COMPILE=aarch64-linux-gnu- CONFIG_ARCH_PINEAPPLE=y CONFIG_CNSS_OUT_OF_TREE=y modules"
+          $MK
+          mkdir -p out-ko
+          find "$P" -name '*.ko' -exec cp -v {} out-ko/ \;
+          ls -l out-ko/
+
+      # ---- qcacld-3.0 (qca_cld3_qca6750.ko), built against the platform modules' Module.symvers ----
+      - name: Build qcacld-3.0
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          Q="$PWD/wlan-src/qcom/opensource/wlan/qcacld-3.0"
+          P="$PWD/wlan-src/qcom/opensource/wlan/platform"
+          MK="make -j$(nproc) -C $KOUT M=$Q ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              WLAN_ROOT=$Q WLAN_COMMON_ROOT=cmn WLAN_COMMON_INC=$Q/cmn \
+              WLAN_FW_API=$Q/../fw-api WLAN_PLATFORM_INC=$Q/../platform/inc \
+              CONFIG_QCA_CLD_WLAN_PROFILE=pineapple_gki_qca6750 \
+              CONFIG_ARCH_PINEAPPLE=y MODNAME=wlan DEVNAME=wlan \
+              KBUILD_EXTRA_SYMBOLS=$P/Module.symvers modules"
+          $MK
+          find "$Q" -name 'qca_cld3_*.ko' -exec cp -v {} out-ko/ \;
+          ls -l out-ko/
+
+      - name: Package test bundle
+        run: |
+          set -euo pipefail
+          cat > out-ko/swap-test.sh <<'EOF'
+          #!/system/bin/sh
+          # Run as root (su -c 'sh swap-test.sh') on the phone. Swaps stock wlan modules for
+          # these freshly built ones, WITHOUT flashing or rebooting. Reversible with restore.sh.
+          set -e
+          DIR="$(dirname "$0")"
+          DST=/vendor_dlkm/lib/modules
+          mkdir -p "$DIR/backup"
+          for f in icnss2 cnss_nl cnss_prealloc cnss_utils qca_cld3_qca6750; do
+            [ -f "$DST/$f.ko" ] && cp -n "$DST/$f.ko" "$DIR/backup/$f.ko.bak" 2>/dev/null || true
+          done
+          rmmod qca_cld3_qca6750 2>/dev/null || true
+          rmmod icnss2 2>/dev/null || true
+          rmmod cnss_prealloc 2>/dev/null || true
+          rmmod cnss_nl 2>/dev/null || true
+          rmmod cnss_utils 2>/dev/null || true
+          insmod "$DIR/cnss_utils.ko"
+          insmod "$DIR/cnss_nl.ko" 2>/dev/null || insmod "$DIR"/cnss_genl*.ko
+          insmod "$DIR/cnss_prealloc.ko"
+          insmod -f "$DIR/icnss2.ko"
+          insmod -f "$DIR/qca_cld3_qca6750.ko"
+          echo "Swapped. Check: dmesg | tail -50  and  ip link show wlan0"
+          EOF
+          cat > out-ko/restore.sh <<'EOF'
+          #!/system/bin/sh
+          # Reverts swap-test.sh: unloads the test modules and reloads the ROM's originals.
+          set -e
+          DIR="$(dirname "$0")"
+          rmmod qca_cld3_qca6750 2>/dev/null || true
+          rmmod icnss2 2>/dev/null || true
+          rmmod cnss_prealloc 2>/dev/null || true
+          rmmod cnss_nl 2>/dev/null || true
+          rmmod cnss_utils 2>/dev/null || true
+          for f in cnss_utils cnss_nl cnss_prealloc icnss2 qca_cld3_qca6750; do
+            [ -f "$DIR/backup/$f.ko.bak" ] && insmod "$DIR/backup/$f.ko.bak" 2>/dev/null || true
+          done
+          echo "Restored stock modules."
+          EOF
+          sed -i 's/^          //' out-ko/swap-test.sh out-ko/restore.sh
+          chmod +x out-ko/swap-test.sh out-ko/restore.sh
+          ZIP="wlan-test-$(date -u +%Y%m%d-%H%M).zip"
+          (cd out-ko && zip -r9 "../$ZIP" .)
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Publish test bundle
+        run: |
+          TAG="wlan-test-$(date -u +%Y%m%d%H%M%S)"
+          gh release create "$TAG" "$ZIP" --prerelease \
+            --title "WLAN driver test build" \
+            --notes "Not flashed. Download on the phone, extract, then: su -c 'sh swap-test.sh' from the extracted folder. Revert with: su -c 'sh restore.sh'"
